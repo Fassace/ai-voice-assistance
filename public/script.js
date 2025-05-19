@@ -1,6 +1,6 @@
-// script.js
+// script.js - Enhanced AI Voice Assistant
 document.addEventListener('DOMContentLoaded', () => {
-  // Elements
+  // DOM Elements
   const elements = {
     pdfInput: document.getElementById('pdfInput'),
     pdfUploadBtn: document.getElementById('pdfUploadBtn'),
@@ -12,26 +12,77 @@ document.addEventListener('DOMContentLoaded', () => {
     audioInput: document.getElementById('audioInput'),
     audioUploadBtn: document.getElementById('audioUploadBtn'),
     transcribedText: document.getElementById('transcribedText'),
-    ttsControls: document.querySelectorAll('.tts-controls button')
+    readBtn: document.getElementById('readBtn'),
+    pauseBtn: document.getElementById('pauseBtn'),
+    resumeBtn: document.getElementById('resumeBtn'),
+    stopBtn: document.getElementById('stopBtn'),
+    statusIndicator: document.getElementById('statusIndicator')
   };
 
+  // Speech Variables
   let utterance = null;
   let recognition = null;
+  let isSpeaking = false;
+  let isListening = false;
 
-  // Event Listeners
-  elements.pdfUploadBtn.addEventListener('click', handlePDFUpload);
-  elements.askBtn.addEventListener('click', handleQuestion);
-  elements.listenBtn.addEventListener('click', toggleListening);
-  elements.audioUploadBtn.addEventListener('click', handleAudioUpload);
-  elements.ttsControls.forEach(btn => btn.addEventListener('click', handleTTS));
+  // Initialize the app
+  function init() {
+    checkBrowserCompatibility();
+    setupEventListeners();
+  }
 
-  // PDF Handling
+  // Check browser capabilities
+  function checkBrowserCompatibility() {
+    const compatibilityWarning = 
+      !('speechSynthesis' in window) ? 'Text-to-speech not supported. ' : '' +
+      !('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) ? 'Speech recognition not supported.' : '';
+
+    if (compatibilityWarning) {
+      showAlert('statusIndicator', compatibilityWarning + ' Try Chrome or Edge.', 'error');
+      disableUnsupportedFeatures();
+    }
+  }
+
+  // Disable unsupported features
+  function disableUnsupportedFeatures() {
+    if (!('speechSynthesis' in window)) {
+      [elements.readBtn, elements.pauseBtn, elements.resumeBtn, elements.stopBtn].forEach(btn => btn.disabled = true);
+    }
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+      elements.listenBtn.disabled = true;
+    }
+  }
+
+  // Setup all event listeners
+  function setupEventListeners() {
+    // File operations
+    elements.pdfUploadBtn.addEventListener('click', handlePDFUpload);
+    elements.audioUploadBtn.addEventListener('click', handleAudioUpload);
+    
+    // AI interaction
+    elements.askBtn.addEventListener('click', handleQuestion);
+    elements.question.addEventListener('keypress', (e) => e.key === 'Enter' && handleQuestion());
+    
+    // Speech recognition
+    elements.listenBtn.addEventListener('click', toggleSpeechRecognition);
+    
+    // Text-to-speech controls
+    elements.readBtn.addEventListener('click', startSpeaking);
+    elements.pauseBtn.addEventListener('click', pauseSpeaking);
+    elements.resumeBtn.addEventListener('click', resumeSpeaking);
+    elements.stopBtn.addEventListener('click', stopSpeaking);
+  }
+
+  // ======================
+  // PDF HANDLING FUNCTIONS
+  // ======================
   async function handlePDFUpload() {
     const file = elements.pdfInput.files[0];
-    if (!file) return showAlert('Please select a PDF file', 'error');
+    if (!file) return showAlert('statusIndicator', 'Please select a PDF file', 'error');
 
     try {
-      showLoading('pdfStatus', 'Processing PDF...');
+      showLoading('statusIndicator', 'Processing PDF');
+      
       const formData = new FormData();
       formData.append('pdfFile', file);
 
@@ -40,101 +91,163 @@ document.addEventListener('DOMContentLoaded', () => {
         body: formData
       });
 
-      if (!response.ok) throw new Error('Upload failed');
+      if (!response.ok) throw new Error(`Server responded with ${response.status}`);
       
       const data = await response.json();
       elements.pdfText.value = data.text || 'No text extracted';
-      showAlert('pdfStatus', 'PDF processed successfully!', 'success');
+      showAlert('statusIndicator', 'PDF processed successfully!', 'success');
     } catch (error) {
-      console.error('PDF Error:', error);
-      showAlert('pdfStatus', 'Failed to process PDF', 'error');
+      console.error('PDF Processing Error:', error);
+      showAlert('statusIndicator', `Failed to process PDF: ${error.message}`, 'error');
     }
   }
 
-  // AI Question Handling
+  // ======================
+  // AI QUESTION HANDLING
+  // ======================
   async function handleQuestion() {
     const question = elements.question.value.trim();
     const pdfText = elements.pdfText.value.trim();
 
     if (!question) return showAlert('aiAnswer', 'Please enter a question', 'error');
-    if (!pdfText) return showAlert('aiAnswer', 'Upload a PDF first', 'error');
+    if (!pdfText) return showAlert('aiAnswer', 'Please upload a PDF first', 'error');
 
     try {
-      showLoading('aiAnswer', 'Processing your question...');
+      showLoading('aiAnswer', 'Processing your question');
+      
       const response = await fetch('/ask-ai', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question, pdfText })
       });
 
-      if (!response.ok) throw new Error('AI request failed');
+      if (!response.ok) throw new Error(`AI request failed with status ${response.status}`);
       
       const data = await response.json();
       showAlert('aiAnswer', data.answer, 'success');
+      
+      // Auto-read the answer if text-to-speech is available
+      if ('speechSynthesis' in window) {
+        speakText(data.answer);
+      }
     } catch (error) {
-      console.error('AI Error:', error);
-      showAlert('aiAnswer', 'Failed to get answer', 'error');
+      console.error('AI Query Error:', error);
+      showAlert('aiAnswer', `Failed to get answer: ${error.message}`, 'error');
     }
   }
 
-  // Voice Recognition
-  function toggleListening() {
+  // ======================
+  // SPEECH RECOGNITION
+  // ======================
+  function toggleSpeechRecognition() {
     if (!recognition) {
       recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
       recognition.continuous = false;
+      recognition.interimResults = false;
       recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        isListening = true;
+        elements.listenBtn.textContent = '🎤 Listening...';
+        showAlert('statusIndicator', 'Listening... Speak now', 'info');
+      };
 
       recognition.onresult = (event) => {
         const transcript = event.results[0][0].transcript;
         elements.question.value = transcript;
+        showAlert('statusIndicator', 'Speech recognized', 'success');
         handleQuestion();
       };
 
       recognition.onerror = (event) => {
-        showAlert('aiAnswer', `Recognition error: ${event.error}`, 'error');
+        console.error('Speech Recognition Error:', event.error);
+        showAlert('statusIndicator', `Recognition error: ${event.error}`, 'error');
+      };
+
+      recognition.onend = () => {
+        isListening = false;
+        elements.listenBtn.textContent = '🎤 Start Listening';
       };
     }
 
-    if (elements.listenBtn.textContent.includes('Start')) {
-      recognition.start();
-      elements.listenBtn.textContent = '🎤 Listening...';
-    } else {
+    if (isListening) {
       recognition.stop();
-      elements.listenBtn.textContent = '🎤 Start Listening';
+    } else {
+      recognition.start();
     }
   }
 
-  // TTS Controls
-  function handleTTS(event) {
-    const action = event.target.id.replace('Btn', '');
-    const text = elements.pdfText.value.trim();
+  // ======================
+  // TEXT-TO-SPEECH CONTROLS
+  // ======================
+  function speakText(text) {
+    if (!text.trim()) {
+      showAlert('statusIndicator', 'No text to read', 'error');
+      return;
+    }
+
+    stopSpeaking(); // Stop any current speech
     
-    if (!text) return showAlert('aiAnswer', 'No text to read', 'error');
+    utterance = new SpeechSynthesisUtterance(text);
+    isSpeaking = true;
+    
+    utterance.onstart = () => {
+      showAlert('statusIndicator', 'Reading text', 'info');
+    };
+    
+    utterance.onend = () => {
+      isSpeaking = false;
+      showAlert('statusIndicator', 'Reading complete', 'success');
+    };
+    
+    utterance.onerror = (event) => {
+      console.error('Speech Synthesis Error:', event);
+      showAlert('statusIndicator', `Speech error: ${event.error}`, 'error');
+      isSpeaking = false;
+    };
+    
+    speechSynthesis.speak(utterance);
+  }
 
-    switch(action) {
-      case 'read':
-        utterance = new SpeechSynthesisUtterance(text);
-        speechSynthesis.speak(utterance);
-        break;
-      case 'pause':
-        speechSynthesis.pause();
-        break;
-      case 'resume':
-        speechSynthesis.resume();
-        break;
-      case 'stop':
-        speechSynthesis.cancel();
-        break;
+  function startSpeaking() {
+    const text = elements.pdfText.value.trim() || elements.aiAnswer.textContent;
+    speakText(text);
+  }
+
+  function pauseSpeaking() {
+    if (speechSynthesis.speaking && !speechSynthesis.paused) {
+      speechSynthesis.pause();
+      isSpeaking = false;
+      showAlert('statusIndicator', 'Speech paused', 'info');
     }
   }
 
-  // Audio Handling
+  function resumeSpeaking() {
+    if (speechSynthesis.paused) {
+      speechSynthesis.resume();
+      isSpeaking = true;
+      showAlert('statusIndicator', 'Resuming speech', 'info');
+    }
+  }
+
+  function stopSpeaking() {
+    if (speechSynthesis.speaking || speechSynthesis.paused) {
+      speechSynthesis.cancel();
+      isSpeaking = false;
+      showAlert('statusIndicator', 'Speech stopped', 'info');
+    }
+  }
+
+  // ======================
+  // AUDIO HANDLING
+  // ======================
   async function handleAudioUpload() {
     const file = elements.audioInput.files[0];
-    if (!file) return showAlert('audioStatus', 'Select an audio file', 'error');
+    if (!file) return showAlert('statusIndicator', 'Please select an audio file', 'error');
 
     try {
-      showLoading('audioStatus', 'Transcribing audio...');
+      showLoading('statusIndicator', 'Transcribing audio');
+      
       const formData = new FormData();
       formData.append('audioFile', file);
 
@@ -143,28 +256,49 @@ document.addEventListener('DOMContentLoaded', () => {
         body: formData
       });
 
-      if (!response.ok) throw new Error('Transcription failed');
+      if (!response.ok) throw new Error(`Transcription failed with status ${response.status}`);
       
       const data = await response.json();
-      elements.transcribedText.value = data.text || 'No transcription';
-      showAlert('audioStatus', 'Transcription complete!', 'success');
+      elements.transcribedText.value = data.text || 'No transcription returned';
+      showAlert('statusIndicator', 'Transcription complete!', 'success');
     } catch (error) {
-      console.error('Audio Error:', error);
-      showAlert('audioStatus', 'Transcription failed', 'error');
+      console.error('Audio Transcription Error:', error);
+      showAlert('statusIndicator', `Transcription failed: ${error.message}`, 'error');
     }
   }
 
-  // UI Helpers
+  // ======================
+  // UI HELPER FUNCTIONS
+  // ======================
   function showAlert(elementId, message, type = 'info') {
     const element = document.getElementById(elementId);
-    element.classList.remove('loading', 'error', 'success');
-    element.classList.add(type);
+    if (!element) {
+      console.error(`Element ${elementId} not found`);
+      return;
+    }
+    
+    element.className = `alert ${type}`;
     element.textContent = message;
+    
+    // Auto-hide info messages after 5 seconds
+    if (type === 'info') {
+      setTimeout(() => {
+        if (element.textContent === message) {
+          element.className = 'alert';
+          element.textContent = '';
+        }
+      }, 5000);
+    }
   }
 
   function showLoading(elementId, message) {
     const element = document.getElementById(elementId);
-    element.classList.add('loading');
-    element.textContent = `${message}...`;
+    if (element) {
+      element.className = 'alert loading';
+      element.textContent = `${message}...`;
+    }
   }
+
+  // Initialize the application
+  init();
 });
