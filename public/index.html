@@ -1,0 +1,56 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AI Voice Assistant</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>AI Voice Assistant</h1>
+
+    <!-- PDF Section -->
+    <div class="section">
+      <label for="pdfInput">Upload PDF:</label>
+      <input type="file" id="pdfInput" accept=".pdf" />
+      <button id="pdfUploadBtn">Upload PDF</button>
+      <div class="status" id="pdfStatus"></div>
+      <textarea id="pdfText" rows="10" readonly>📄 PDF text will appear here...</textarea>
+    </div>
+
+    <!-- QA Section -->
+    <div class="section">
+      <div class="input-group">
+        <input type="text" id="question" placeholder="Ask a question..." />
+        <button id="askBtn">Ask AI</button>
+      </div>
+      <div class="answer-box" id="aiAnswer">💡 Answer will appear here...</div>
+    </div>
+
+    <!-- Voice Controls -->
+    <div class="section voice-controls">
+      <button id="listenBtn">🎤 Start Listening</button>
+      <div class="tts-controls">
+        <button id="readBtn">▶️ Read</button>
+        <button id="pauseBtn">⏸️ Pause</button>
+        <button id="resumeBtn">🔁 Resume</button>
+        <button id="stopBtn">⏹️ Stop</button>
+      </div>
+    </div>
+
+    <!-- Audio Section -->
+    <div class="section">
+      <label for="audioInput">Upload Audio:</label>
+      <input type="file" id="audioInput" accept="audio/*" />
+      <button id="audioUploadBtn">Transcribe Audio</button>
+      <div class="status" id="audioStatus"></div>
+      <textarea id="transcribedText" rows="6" readonly>🎧 Transcription will appear here...</textarea>
+    </div>
+
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
