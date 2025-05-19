@@ -14,7 +14,10 @@ const PORT = process.env.PORT;
 
 // Configurations
 const upload = multer({ storage: multer.memoryStorage() });
-app.use(cors());
+app.use(cors({
+  origin: ['https://ai-voice-assistance-rtbo.onrender.com', 'http://localhost:5000'],
+  methods: ['GET', 'POST']
+}));
 app.use(express.json());
 app.use(express.static('public'));
 
