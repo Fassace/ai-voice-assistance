@@ -3,21 +3,39 @@ const multer = require('multer');
 const cors = require('cors');
 const pdfParse = require('pdf-parse');
 const axios = require('axios');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Enhanced configuration
-const upload = multer({ storage: multer.memoryStorage() });
-app.use(cors({ origin: true })); // Allows all origins in development
+// Enhanced Configurations
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { 
+    fileSize: 25 * 1024 * 1024, // 25MB limit
+    files: 1
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['application/pdf', 'audio/*'];
+    if (!allowedTypes.some(type => file.mimetype.includes(type.split('/')[0]))) {
+      return cb(new Error('Invalid file type'), false);
+    }
+    cb(null, true);
+  }
+});
+
+app.use(cors({
+  origin: ['https://ai-voice-assistance-rtbo.onrender.com', 'http://localhost:5000'],
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 app.use(express.static('public'));
 
-// Improved Groq API Service
-const queryAI = async (prompt, context) => {
+// Enhanced Groq AI Service with Retry Logic
+const queryAI = async (prompt, retries = 3) => {
   try {
-    // Validate API key
     if (!process.env.GROQ_API_KEY) {
       throw new Error('Groq API key not configured');
     }
@@ -29,108 +47,244 @@ const queryAI = async (prompt, context) => {
         messages: [
           {
             role: 'system',
-            content: 'You are a helpful AI assistant. Answer questions based strictly on the provided context.'
+            content: 'You are a helpful AI assistant. Provide concise, accurate answers based on the context.'
           },
           {
             role: 'user',
-            content: `Context: ${context}\n\nQuestion: ${prompt}\nAnswer:`
+            content: prompt
           }
         ],
         temperature: 0.3,
-        max_tokens: 1024
+        max_tokens: 1024,
+        top_p: 0.9
       },
       {
         headers: {
           'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 15000 // 15 second timeout
+        timeout: 30000
       }
     );
 
     if (!response.data.choices?.[0]?.message?.content) {
-      throw new Error('Unexpected API response format');
+      throw new Error('Invalid response format from Groq API');
     }
 
-    return response.data.choices[0].message.content.trim();
+    return {
+      answer: response.data.choices[0].message.content.trim(),
+      usage: response.data.usage
+    };
   } catch (error) {
-    console.error('Groq API Error Details:', {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
-    });
+    console.error(`Groq API Attempt ${4-retries} failed:`, error.message);
+    
+    if (retries > 0 && error.response?.status !== 401) {
+      await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)));
+      return queryAI(prompt, retries - 1);
+    }
     
     throw new Error(
-      error.response?.data?.error?.message ||
-      error.response?.statusText ||
+      error.response?.data?.error?.message || 
+      error.message || 
       'Failed to process AI request'
     );
   }
 };
 
-// Enhanced Routes with Better Error Handling
-app.post('/ask-ai', async (req, res) => {
+// Enhanced PDF Processing Route
+app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   try {
-    const { question, pdfText } = req.body;
-
-    // Validate input
-    if (!question?.trim() || !pdfText?.trim()) {
+    if (!req.file) {
       return res.status(400).json({ 
-        error: 'Both question and PDF text are required',
-        received: { question, pdfText: pdfText ? '(exists)' : 'missing' }
+        error: 'No file uploaded',
+        acceptedTypes: ['application/pdf']
       });
     }
 
-    const answer = await queryAI(question, pdfText);
-    
+    // Validate PDF magic number
+    if (req.file.buffer.slice(0, 4).toString() !== '%PDF') {
+      return res.status(415).json({ 
+        error: 'Invalid PDF file',
+        details: 'File header does not match PDF signature'
+      });
+    }
+
+    const data = await pdfParse(req.file.buffer);
+    const cleanText = data.text
+      .replace(/\s+/g, ' ')
+      .replace(/[^\w\s.,!?;:'"-]/g, '')
+      .trim();
+
+    if (!cleanText) {
+      console.warn('PDF parsed but no text extracted:', {
+        pages: data.numpages,
+        metadata: data.info
+      });
+    }
+
     res.json({ 
-      answer,
-      model: 'mixtral-8x7b-32768',
-      timestamp: new Date().toISOString()
+      success: true,
+      text: cleanText || 'No extractable text found',
+      metadata: {
+        pages: data.numpages,
+        version: data.version,
+        info: data.info
+      }
     });
 
   } catch (error) {
-    console.error('AI Processing Pipeline Error:', error);
+    console.error('PDF Processing Error:', {
+      error: error.message,
+      file: req.file?.originalname,
+      size: req.file?.size
+    });
+
+    const statusCode = error.message.includes('Invalid PDF') ? 415 : 500;
     
-    const statusCode = error.message.includes('API key') ? 401 : 
-                      error.message.includes('required') ? 400 : 500;
+    res.status(statusCode).json({
+      error: 'PDF processing failed',
+      details: error.message,
+      solution: statusCode === 415 ? 
+        'Upload a valid PDF file' : 
+        'Try again or contact support'
+    });
+  }
+});
+
+// Enhanced AI Question Answering
+app.post('/ask-ai', async (req, res) => {
+  try {
+    const { question, pdfText } = req.body;
+    
+    if (!question?.trim() || !pdfText?.trim()) {
+      return res.status(400).json({ 
+        error: 'Invalid input',
+        details: {
+          questionProvided: !!question,
+          textProvided: !!pdfText
+        }
+      });
+    }
+
+    const prompt = `Context:\n${pdfText}\n\nQuestion: ${question}\nProvide a concise answer:`;
+    const { answer, usage } = await queryAI(prompt);
+    
+    res.json({ 
+      success: true,
+      answer,
+      model: 'mixtral-8x7b-32768',
+      timestamp: new Date().toISOString(),
+      usage
+    });
+
+  } catch (error) {
+    console.error('AI Processing Error:', {
+      error: error.message,
+      question: req.body.question?.length,
+      contextLength: req.body.pdfText?.length
+    });
+
+    const statusCode = error.message.includes('API key') ? 401 : 500;
     
     res.status(statusCode).json({
       error: 'AI processing failed',
       details: error.message,
       solution: statusCode === 401 ? 
-        'Check your GROQ_API_KEY in .env file' :
-        'Try again with a different question or PDF content'
+        'Check your GROQ_API_KEY configuration' : 
+        'Try again with a different question'
     });
   }
 });
 
-// [Keep your existing PDF and audio routes...]
-
-// New Debug Endpoint
-app.get('/debug/ai', async (req, res) => {
+// Audio Route with Better Error Handling
+app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
   try {
-    const testPrompt = "What is 2+2?";
-    const answer = await queryAI(testPrompt, "Basic math question");
-    res.json({
-      status: 'success',
-      answer,
-      apiHealth: 'operational'
-    });
+    if (!req.file) {
+      return res.status(400).json({ 
+        error: 'No audio file uploaded',
+        acceptedTypes: ['audio/mpeg', 'audio/wav', 'audio/ogg']
+      });
+    }
+
+    // Basic validation
+    if (req.file.size > 10 * 1024 * 1024) {
+      return res.status(413).json({
+        error: 'File too large',
+        maxSize: '10MB',
+        received: `${(req.file.size / (1024 * 1024)).toFixed(2)}MB`
+      });
+    }
+
+    // Implementation placeholder
+    throw new Error('Audio processing not implemented');
+    
   } catch (error) {
-    res.status(500).json({
-      status: 'failed',
+    console.error('Audio Processing Error:', {
       error: error.message,
-      configuration: {
-        hasApiKey: !!process.env.GROQ_API_KEY,
-        keyLength: process.env.GROQ_API_KEY?.length || 0
-      }
+      fileType: req.file?.mimetype,
+      fileSize: req.file?.size
+    });
+
+    res.status(500).json({
+      error: 'Audio processing unavailable',
+      details: error.message,
+      upcomingFeatures: [
+        'Local Whisper.cpp integration',
+        'AssemblyAI cloud service'
+      ]
     });
   }
+});
+
+// Enhanced Health Check
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    services: {
+      pdf_processing: 'active',
+      groq_ai: process.env.GROQ_API_KEY ? 'configured' : 'missing_api_key',
+      audio_transcription: 'not_implemented',
+      memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`
+    }
+  };
+
+  try {
+    // Test Groq connectivity
+    if (process.env.GROQ_API_KEY) {
+      const test = await axios.get('https://api.groq.com/openai/v1/models', {
+        headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+        timeout: 5000
+      });
+      health.services.groq_ai = test.data ? 'operational' : 'unavailable';
+    }
+  } catch (error) {
+    health.services.groq_ai = 'connection_failed';
+    health.groq_error = error.message;
+  }
+
+  res.json(health);
+});
+
+// Error Handling Middleware
+app.use((err, req, res, next) => {
+  console.error('Server Error:', {
+    error: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method
+  });
+
+  res.status(500).json({
+    error: 'Internal server error',
+    requestId: req.id,
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Groq API Status: ${process.env.GROQ_API_KEY ? 'Configured' : 'MISSING KEY'}`);
-  console.log(`Test endpoint: http://localhost:${PORT}/debug/ai`);
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Groq API: ${process.env.GROQ_API_KEY ? 'Configured' : 'Not configured'}`);
+  console.log(`PDF Limit: 25MB | Audio Limit: 10MB`);
 });
