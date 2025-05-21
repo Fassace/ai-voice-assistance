@@ -9,11 +9,11 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configurations
+// Configurations (unchanged)
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: { 
-    fileSize: 25 * 1024 * 1024, // 25MB limit
+    fileSize: 25 * 1024 * 1024,
     files: 1
   },
   fileFilter: (req, file, cb) => {
@@ -33,15 +33,16 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static('public'));
 
-// Hugging Face AI Service
+// Modified Hugging Face AI Service
 const queryAI = async (prompt, retries = 3) => {
   try {
     if (!process.env.HUGGINGFACE_API_KEY) {
       throw new Error('Hugging Face API key not configured');
     }
 
+    // Changed to free-tier friendly model
     const response = await axios.post(
-      'https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1',
+      'https://api-inference.huggingface.co/models/google/gemma-7b-it',
       { inputs: prompt },
       {
         headers: {
@@ -52,17 +53,22 @@ const queryAI = async (prompt, retries = 3) => {
       }
     );
 
-    // Handle different response formats from Hugging Face
-    const answer = response.data[0]?.generated_text || 
-                  response.data?.generated_text || 
+    // Handle response format for Gemma model
+    const answer = response.data?.generated_text || 
+                  (Array.isArray(response.data) ? response.data[0]?.generated_text : '') || 
                   'No answer generated';
 
     return {
-      answer: answer.replace(prompt, '').trim(), // Remove the prompt from response
-      model: 'mistral-7b-instruct'
+      answer: answer.replace(prompt, '').trim(),
+      model: 'gemma-7b-it' // Updated model name
     };
   } catch (error) {
     console.error(`Hugging Face API Attempt ${4-retries} failed:`, error.message);
+    
+    // Added specific handling for free-tier limits
+    if (error.response?.status === 429) {
+      throw new Error('Free tier rate limit reached. Try again later.');
+    }
     
     if (retries > 0 && error.response?.status !== 401) {
       await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)));
@@ -77,7 +83,7 @@ const queryAI = async (prompt, retries = 3) => {
   }
 };
 
-// PDF Processing Route (without text cleaning)
+// PDF Processing Route (unchanged)
 app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -87,7 +93,6 @@ app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
       });
     }
 
-    // Validate PDF magic number
     if (req.file.buffer.slice(0, 4).toString() !== '%PDF') {
       return res.status(415).json({ 
         error: 'Invalid PDF file',
@@ -97,10 +102,9 @@ app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
 
     const data = await pdfParse(req.file.buffer);
     
-    // Return raw text without cleaning
     res.json({ 
       success: true,
-      text: data.text, // No text cleaning applied
+      text: data.text,
       metadata: {
         pages: data.numpages,
         version: data.version,
@@ -127,7 +131,7 @@ app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   }
 });
 
-// AI Question Answering
+// AI Question Answering (updated model reference)
 app.post('/ask-ai', async (req, res) => {
   try {
     const { question, pdfText } = req.body;
@@ -148,7 +152,7 @@ app.post('/ask-ai', async (req, res) => {
     res.json({ 
       success: true,
       answer,
-      model: 'mistral-7b-instruct',
+      model: 'gemma-7b-it', // Updated model name
       timestamp: new Date().toISOString()
     });
 
@@ -159,19 +163,23 @@ app.post('/ask-ai', async (req, res) => {
       contextLength: req.body.pdfText?.length
     });
 
-    const statusCode = error.message.includes('API key') ? 401 : 500;
+    const statusCode = error.message.includes('API key') ? 401 : 
+                      error.message.includes('rate limit') ? 429 : 
+                      500;
     
     res.status(statusCode).json({
       error: 'AI processing failed',
       details: error.message,
       solution: statusCode === 401 ? 
         'Check your HUGGINGFACE_API_KEY configuration' : 
+        statusCode === 429 ?
+        'Free tier limit reached. Try again later or upgrade account.' :
         'Try again with a different question'
     });
   }
 });
 
-// Audio Route with Hugging Face Whisper
+// Modified Audio Route with free-tier Whisper
 app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -181,7 +189,6 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       });
     }
 
-    // Basic validation
     if (req.file.size > 10 * 1024 * 1024) {
       return res.status(413).json({
         error: 'File too large',
@@ -190,11 +197,11 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       });
     }
 
-    // Determine content type
     const contentType = req.file.mimetype === 'audio/mpeg' ? 'audio/mpeg' : 'audio/wav';
 
+    // Changed to free-tier compatible Whisper model
     const response = await axios.post(
-      'https://api-inference.huggingface.co/models/openai/whisper-large-v3',
+      'https://api-inference.huggingface.co/models/facebook/whisper-medium.en',
       req.file.buffer,
       {
         headers: {
@@ -206,7 +213,8 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
     );
 
     const transcription = response.data.text || 
-                         (response.data[0] && response.data[0].transcription_text);
+                         response.data?.transcription_text ||
+                         (response.data[0]?.transcription_text);
     
     if (!transcription) {
       throw new Error('No transcription returned from API');
@@ -215,7 +223,7 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
     res.json({
       success: true,
       text: transcription,
-      model: 'whisper-large-v3'
+      model: 'whisper-medium.en' // Updated model name
     });
     
   } catch (error) {
@@ -225,15 +233,19 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       fileSize: req.file?.size
     });
 
-    res.status(500).json({
+    const statusCode = error.message.includes('rate limit') ? 429 : 500;
+    
+    res.status(statusCode).json({
       error: 'Audio processing failed',
       details: error.message,
-      solution: 'Try again or check your API key'
+      solution: statusCode === 429 ?
+        'Free tier limit reached. Try again later.' :
+        'Try again or check your API key'
     });
   }
 });
 
-// Health Check Endpoint
+// Health Check Endpoint (unchanged)
 app.get('/health', async (req, res) => {
   const health = {
     status: 'healthy',
@@ -247,7 +259,6 @@ app.get('/health', async (req, res) => {
   };
 
   try {
-    // Test Hugging Face connectivity
     if (process.env.HUGGINGFACE_API_KEY) {
       const test = await axios.get('https://api-inference.huggingface.co/models', {
         headers: { 'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}` },
@@ -263,7 +274,7 @@ app.get('/health', async (req, res) => {
   res.json(health);
 });
 
-// Error Handling Middleware
+// Error Handling Middleware (unchanged)
 app.use((err, req, res, next) => {
   console.error('Server Error:', {
     error: err.message,
