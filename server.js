@@ -33,7 +33,7 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static('public'));
 
-// Enhanced Hugging Face AI Service with fallback options
+// Text Generation with Hugging Face (unchanged)
 const queryAI = async (prompt, retries = 3) => {
   try {
     if (!process.env.HUGGINGFACE_API_KEY) {
@@ -66,7 +66,7 @@ const queryAI = async (prompt, retries = 3) => {
     
     if (error.response?.status === 402) {
       return {
-        answer: "I can't process this right now (API credits exhausted). Please try again later.",
+        answer: "I can't process this right now (API credits exhausted). Please try again later or consider upgrading your account.",
         model: 'fallback',
         source: 'local'
       };
@@ -168,7 +168,81 @@ app.post('/ask-ai', async (req, res) => {
   }
 });
 
-// Modified Audio Route with AssemblyAI
+// Audio Transcription with AssemblyAI
+const transcribeWithAssemblyAI = async (audioBuffer, contentType) => {
+  try {
+    // Step 1: Upload audio file
+    const uploadResponse = await axios.post(
+      'https://api.assemblyai.com/v2/upload',
+      audioBuffer,
+      {
+        headers: {
+          'Authorization': process.env.ASSEMBLYAI_API_KEY,
+          'Content-Type': contentType
+        },
+        timeout: 30000
+      }
+    );
+
+    // Step 2: Start transcription
+    const transcriptionResponse = await axios.post(
+      'https://api.assemblyai.com/v2/transcript',
+      {
+        audio_url: uploadResponse.data.upload_url,
+        language_detection: true
+      },
+      {
+        headers: {
+          'Authorization': process.env.ASSEMBLYAI_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    // Step 3: Poll for results
+    const transcriptId = transcriptionResponse.data.id;
+    let status = 'queued';
+    let transcriptText = '';
+    const startTime = Date.now();
+    
+    while (status !== 'completed' && Date.now() - startTime < 180000) { // 3 minute timeout
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const statusResponse = await axios.get(
+        `https://api.assemblyai.com/v2/transcript/${transcriptId}`,
+        {
+          headers: {
+            'Authorization': process.env.ASSEMBLYAI_API_KEY
+          }
+        }
+      );
+      
+      status = statusResponse.data.status;
+      if (status === 'completed') {
+        transcriptText = statusResponse.data.text;
+        break;
+      }
+      if (status === 'error') {
+        throw new Error(`Transcription failed: ${statusResponse.data.error}`);
+      }
+    }
+
+    if (!transcriptText) {
+      throw new Error('Transcription timed out');
+    }
+
+    return {
+      text: transcriptText,
+      model: 'assemblyai',
+      source: 'api'
+    };
+  } catch (error) {
+    console.error('AssemblyAI Transcription Error:', error.message);
+    throw error;
+  }
+};
+
+// Updated Audio Route using AssemblyAI
 app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -187,67 +261,15 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       });
     }
 
-    // Upload to AssemblyAI
-    const uploadResponse = await axios.post(
-      'https://api.assemblyai.com/v2/upload',
-      req.file.buffer,
-      {
-        headers: {
-          'Authorization': process.env.ASSEMBLYAI_API_KEY,
-          'Content-Type': req.file.mimetype
-        },
-        timeout: 30000
-      }
-    );
-
-    // Start transcription
-    const transcriptResponse = await axios.post(
-      'https://api.assemblyai.com/v2/transcript',
-      {
-        audio_url: uploadResponse.data.upload_url
-      },
-      {
-        headers: {
-          'Authorization': process.env.ASSEMBLYAI_API_KEY,
-          'Content-Type': 'application/json'
-        },
-        timeout: 30000
-      }
-    );
-
-    // Poll for results
-    let status = 'queued';
-    let transcription = '';
-    const startTime = Date.now();
-    while (status !== 'completed' && Date.now() - startTime < 180000) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const statusResponse = await axios.get(
-        `https://api.assemblyai.com/v2/transcript/${transcriptResponse.data.id}`,
-        {
-          headers: {
-            'Authorization': process.env.ASSEMBLYAI_API_KEY
-          }
-        }
-      );
-      status = statusResponse.data.status;
-      if (status === 'completed') {
-        transcription = statusResponse.data.text;
-        break;
-      }
-      if (status === 'error') {
-        throw new Error(statusResponse.data.error);
-      }
-    }
-
-    if (!transcription) {
-      throw new Error('Transcription timed out');
-    }
-
+    const contentType = req.file.mimetype === 'audio/mpeg' ? 'audio/mpeg' : 'audio/wav';
+    const { text, model, source } = await transcribeWithAssemblyAI(req.file.buffer, contentType);
+    
     res.json({
       success: true,
-      text: transcription,
-      model: 'assemblyai',
-      source: 'api'
+      text,
+      model,
+      source,
+      timestamp: new Date().toISOString()
     });
     
   } catch (error) {
@@ -265,7 +287,8 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
     res.status(statusCode).json({
       error: 'Audio processing failed',
       details: error.message,
-      solution
+      solution,
+      maxRecommendedSize: '5MB'
     });
   }
 });
@@ -277,11 +300,11 @@ app.get('/health', async (req, res) => {
     timestamp: new Date().toISOString(),
     services: {
       pdf_processing: 'active',
-      text_generation: process.env.HUGGINGFACE_API_KEY ? 'huggingface-configured' : 'huggingface-missing-key',
-      audio_transcription: process.env.ASSEMBLYAI_API_KEY ? 'assemblyai-configured' : 'assemblyai-missing-key',
-      memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`
-    },
-    warnings: []
+      text_generation: process.env.HUGGINGFACE_API_KEY ? 'configured' : 'missing_api_key',
+      audio_transcription: process.env.ASSEMBLYAI_API_KEY ? 'configured' : 'missing_api_key',
+      memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`,
+      warnings: []
+    }
   };
 
   // Test Hugging Face connection
@@ -292,7 +315,7 @@ app.get('/health', async (req, res) => {
         timeout: 5000
       });
     } catch (error) {
-      health.services.text_generation = 'huggingface-connection-failed';
+      health.services.text_generation = 'connection_failed';
       health.warnings.push('Hugging Face connection failed');
     }
   }
@@ -305,7 +328,7 @@ app.get('/health', async (req, res) => {
         timeout: 5000
       });
     } catch (error) {
-      health.services.audio_transcription = 'assemblyai-connection-failed';
+      health.services.audio_transcription = 'connection_failed';
       health.warnings.push('AssemblyAI connection failed');
     }
   }
