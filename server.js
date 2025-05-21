@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configurations (unchanged)
+// Configurations
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: { 
@@ -33,14 +33,13 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static('public'));
 
-// Modified Hugging Face AI Service
+// Enhanced Hugging Face AI Service with fallback options
 const queryAI = async (prompt, retries = 3) => {
   try {
     if (!process.env.HUGGINGFACE_API_KEY) {
       throw new Error('Hugging Face API key not configured');
     }
 
-    // Changed to free-tier friendly model
     const response = await axios.post(
       'https://api-inference.huggingface.co/models/google/gemma-7b-it',
       { inputs: prompt },
@@ -53,21 +52,25 @@ const queryAI = async (prompt, retries = 3) => {
       }
     );
 
-    // Handle response format for Gemma model
     const answer = response.data?.generated_text || 
                   (Array.isArray(response.data) ? response.data[0]?.generated_text : '') || 
                   'No answer generated';
 
     return {
       answer: answer.replace(prompt, '').trim(),
-      model: 'gemma-7b-it' // Updated model name
+      model: 'gemma-7b-it',
+      source: 'huggingface'
     };
   } catch (error) {
     console.error(`Hugging Face API Attempt ${4-retries} failed:`, error.message);
     
-    // Added specific handling for free-tier limits
-    if (error.response?.status === 429) {
-      throw new Error('Free tier rate limit reached. Try again later.');
+    if (error.response?.status === 402) {
+      // If credits exhausted, try local fallback or return informative message
+      return {
+        answer: "I can't process this right now (API credits exhausted). Please try again later or consider upgrading your account.",
+        model: 'fallback',
+        source: 'local'
+      };
     }
     
     if (retries > 0 && error.response?.status !== 401) {
@@ -83,7 +86,7 @@ const queryAI = async (prompt, retries = 3) => {
   }
 };
 
-// PDF Processing Route (unchanged)
+// PDF Processing Route
 app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -113,25 +116,16 @@ app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
     });
 
   } catch (error) {
-    console.error('PDF Processing Error:', {
-      error: error.message,
-      file: req.file?.originalname,
-      size: req.file?.size
-    });
-
+    console.error('PDF Processing Error:', error.message);
     const statusCode = error.message.includes('Invalid PDF') ? 415 : 500;
-    
     res.status(statusCode).json({
       error: 'PDF processing failed',
-      details: error.message,
-      solution: statusCode === 415 ? 
-        'Upload a valid PDF file' : 
-        'Try again or contact support'
+      details: error.message
     });
   }
 });
 
-// AI Question Answering (updated model reference)
+// Enhanced AI Question Answering with better error handling
 app.post('/ask-ai', async (req, res) => {
   try {
     const { question, pdfText } = req.body;
@@ -147,22 +141,20 @@ app.post('/ask-ai', async (req, res) => {
     }
 
     const prompt = `Context:\n${pdfText}\n\nQuestion: ${question}\nAnswer:`;
-    const { answer } = await queryAI(prompt);
+    const { answer, model, source } = await queryAI(prompt);
     
     res.json({ 
       success: true,
       answer,
-      model: 'gemma-7b-it', // Updated model name
-      timestamp: new Date().toISOString()
+      model,
+      source,
+      timestamp: new Date().toISOString(),
+      creditsInfo: source === 'local' ? 'API credits exhausted - using fallback response' : undefined
     });
 
   } catch (error) {
-    console.error('AI Processing Error:', {
-      error: error.message,
-      question: req.body.question?.length,
-      contextLength: req.body.pdfText?.length
-    });
-
+    console.error('AI Processing Error:', error.message);
+    
     const statusCode = error.message.includes('API key') ? 401 : 
                       error.message.includes('rate limit') ? 429 : 
                       500;
@@ -170,16 +162,14 @@ app.post('/ask-ai', async (req, res) => {
     res.status(statusCode).json({
       error: 'AI processing failed',
       details: error.message,
-      solution: statusCode === 401 ? 
-        'Check your HUGGINGFACE_API_KEY configuration' : 
-        statusCode === 429 ?
-        'Free tier limit reached. Try again later or upgrade account.' :
-        'Try again with a different question'
+      solution: statusCode === 401 ? 'Check API configuration' :
+               statusCode === 429 ? 'Rate limit reached - try later' :
+               'Try again with different input'
     });
   }
 });
 
-// Modified Audio Route with free-tier Whisper
+// Enhanced Audio Route with better error handling
 app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -189,17 +179,17 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       });
     }
 
-    if (req.file.size > 10 * 1024 * 1024) {
+    if (req.file.size > 5 * 1024 * 1024) { // Reduced from 10MB to 5MB
       return res.status(413).json({
         error: 'File too large',
-        maxSize: '10MB',
-        received: `${(req.file.size / (1024 * 1024)).toFixed(2)}MB`
+        maxSize: '5MB',
+        received: `${(req.file.size / (1024 * 1024)).toFixed(2)}MB`,
+        solution: 'Compress your audio or use shorter recordings'
       });
     }
 
     const contentType = req.file.mimetype === 'audio/mpeg' ? 'audio/mpeg' : 'audio/wav';
 
-    // Changed to free-tier compatible Whisper model
     const response = await axios.post(
       'https://api-inference.huggingface.co/models/facebook/whisper-medium.en',
       req.file.buffer,
@@ -214,78 +204,81 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
 
     const transcription = response.data.text || 
                          response.data?.transcription_text ||
-                         (response.data[0]?.transcription_text);
+                         (response.data[0]?.transcription_text) ||
+                         'No transcription available';
     
-    if (!transcription) {
-      throw new Error('No transcription returned from API');
-    }
-
     res.json({
       success: true,
       text: transcription,
-      model: 'whisper-medium.en' // Updated model name
+      model: 'whisper-medium.en',
+      source: 'huggingface'
     });
     
   } catch (error) {
-    console.error('Audio Processing Error:', {
-      error: error.message,
-      fileType: req.file?.mimetype,
-      fileSize: req.file?.size
-    });
-
-    const statusCode = error.message.includes('rate limit') ? 429 : 500;
+    console.error('Audio Processing Error:', error.message);
     
+    const statusCode = error.response?.status || 500;
+    let solution = 'Try again later';
+    
+    if (statusCode === 402) {
+      solution = 'API credits exhausted. Options:\n' +
+                '1. Upgrade Hugging Face account\n' +
+                '2. Use client-side Whisper.js\n' +
+                '3. Try smaller audio files (<1MB)';
+    } else if (statusCode === 429) {
+      solution = 'Rate limit reached. Try again in a few minutes.';
+    }
+
     res.status(statusCode).json({
       error: 'Audio processing failed',
       details: error.message,
-      solution: statusCode === 429 ?
-        'Free tier limit reached. Try again later.' :
-        'Try again or check your API key'
+      solution,
+      maxRecommendedSize: '1MB for free tier'
     });
   }
 });
 
-// Health Check Endpoint (unchanged)
+// Enhanced Health Check Endpoint
 app.get('/health', async (req, res) => {
   const health = {
-    status: 'healthy',
+    status: 'operational',
     timestamp: new Date().toISOString(),
     services: {
       pdf_processing: 'active',
       huggingface_ai: process.env.HUGGINGFACE_API_KEY ? 'configured' : 'missing_api_key',
       audio_transcription: process.env.HUGGINGFACE_API_KEY ? 'available' : 'requires_api_key',
-      memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`
+      memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`,
+      warnings: []
     }
   };
 
   try {
     if (process.env.HUGGINGFACE_API_KEY) {
-      const test = await axios.get('https://api-inference.huggingface.co/models', {
+      const test = await axios.get('https://api-inference.huggingface.co/status', {
         headers: { 'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}` },
         timeout: 5000
       });
-      health.services.huggingface_ai = test.data ? 'operational' : 'unavailable';
+      health.services.huggingface_status = test.data;
+      
+      if (test.data?.loaded && test.data.loaded < 1) {
+        health.warnings.push('Hugging Face models may need warm-up');
+      }
     }
   } catch (error) {
-    health.services.huggingface_ai = 'connection_failed';
-    health.huggingface_error = error.message;
+    health.services.huggingface_status = 'connection_failed';
+    health.warnings.push(`HF API: ${error.message}`);
   }
 
   res.json(health);
 });
 
-// Error Handling Middleware (unchanged)
+// Error Handling Middleware
 app.use((err, req, res, next) => {
-  console.error('Server Error:', {
-    error: err.message,
-    stack: err.stack,
-    path: req.path,
-    method: req.method
-  });
-
+  console.error('Server Error:', err.stack);
   res.status(500).json({
     error: 'Internal server error',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    path: req.path
   });
 });
 
@@ -293,5 +286,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Hugging Face API: ${process.env.HUGGINGFACE_API_KEY ? 'Configured' : 'Not configured'}`);
-  console.log(`PDF Limit: 25MB | Audio Limit: 10MB`);
+  console.log(`PDF Limit: 25MB | Audio Limit: 5MB`);
 });
