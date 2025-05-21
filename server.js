@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configurations
+// Configurations (unchanged)
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: { 
@@ -65,9 +65,8 @@ const queryAI = async (prompt, retries = 3) => {
     console.error(`Hugging Face API Attempt ${4-retries} failed:`, error.message);
     
     if (error.response?.status === 402) {
-      // If credits exhausted, try local fallback or return informative message
       return {
-        answer: "I can't process this right now (API credits exhausted). Please try again later or consider upgrading your account.",
+        answer: "I can't process this right now (API credits exhausted). Please try again later.",
         model: 'fallback',
         source: 'local'
       };
@@ -86,7 +85,7 @@ const queryAI = async (prompt, retries = 3) => {
   }
 };
 
-// PDF Processing Route
+// PDF Processing Route (unchanged)
 app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -125,7 +124,7 @@ app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   }
 });
 
-// Enhanced AI Question Answering with better error handling
+// AI Question Answering (unchanged)
 app.post('/ask-ai', async (req, res) => {
   try {
     const { question, pdfText } = req.body;
@@ -169,7 +168,7 @@ app.post('/ask-ai', async (req, res) => {
   }
 });
 
-// Enhanced Audio Route with better error handling
+// Modified Audio Route with AssemblyAI
 app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -179,7 +178,7 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       });
     }
 
-    if (req.file.size > 5 * 1024 * 1024) { // Reduced from 10MB to 5MB
+    if (req.file.size > 5 * 1024 * 1024) {
       return res.status(413).json({
         error: 'File too large',
         maxSize: '5MB',
@@ -188,30 +187,67 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       });
     }
 
-    const contentType = req.file.mimetype === 'audio/mpeg' ? 'audio/mpeg' : 'audio/wav';
-
-    const response = await axios.post(
-      'https://api-inference.huggingface.co/models/facebook/whisper-medium.en',
+    // Upload to AssemblyAI
+    const uploadResponse = await axios.post(
+      'https://api.assemblyai.com/v2/upload',
       req.file.buffer,
       {
         headers: {
-          'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-          'Content-Type': contentType
+          'Authorization': process.env.ASSEMBLYAI_API_KEY,
+          'Content-Type': req.file.mimetype
         },
         timeout: 30000
       }
     );
 
-    const transcription = response.data.text || 
-                         response.data?.transcription_text ||
-                         (response.data[0]?.transcription_text) ||
-                         'No transcription available';
-    
+    // Start transcription
+    const transcriptResponse = await axios.post(
+      'https://api.assemblyai.com/v2/transcript',
+      {
+        audio_url: uploadResponse.data.upload_url
+      },
+      {
+        headers: {
+          'Authorization': process.env.ASSEMBLYAI_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    // Poll for results
+    let status = 'queued';
+    let transcription = '';
+    const startTime = Date.now();
+    while (status !== 'completed' && Date.now() - startTime < 180000) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const statusResponse = await axios.get(
+        `https://api.assemblyai.com/v2/transcript/${transcriptResponse.data.id}`,
+        {
+          headers: {
+            'Authorization': process.env.ASSEMBLYAI_API_KEY
+          }
+        }
+      );
+      status = statusResponse.data.status;
+      if (status === 'completed') {
+        transcription = statusResponse.data.text;
+        break;
+      }
+      if (status === 'error') {
+        throw new Error(statusResponse.data.error);
+      }
+    }
+
+    if (!transcription) {
+      throw new Error('Transcription timed out');
+    }
+
     res.json({
       success: true,
       text: transcription,
-      model: 'whisper-medium.en',
-      source: 'huggingface'
+      model: 'assemblyai',
+      source: 'api'
     });
     
   } catch (error) {
@@ -221,10 +257,7 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
     let solution = 'Try again later';
     
     if (statusCode === 402) {
-      solution = 'API credits exhausted. Options:\n' +
-                '1. Upgrade Hugging Face account\n' +
-                '2. Use client-side Whisper.js\n' +
-                '3. Try smaller audio files (<1MB)';
+      solution = 'API credits exhausted. Consider upgrading your AssemblyAI plan.';
     } else if (statusCode === 429) {
       solution = 'Rate limit reached. Try again in a few minutes.';
     }
@@ -232,47 +265,55 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
     res.status(statusCode).json({
       error: 'Audio processing failed',
       details: error.message,
-      solution,
-      maxRecommendedSize: '1MB for free tier'
+      solution
     });
   }
 });
 
-// Enhanced Health Check Endpoint
+// Updated Health Check Endpoint
 app.get('/health', async (req, res) => {
   const health = {
     status: 'operational',
     timestamp: new Date().toISOString(),
     services: {
       pdf_processing: 'active',
-      huggingface_ai: process.env.HUGGINGFACE_API_KEY ? 'configured' : 'missing_api_key',
-      audio_transcription: process.env.HUGGINGFACE_API_KEY ? 'available' : 'requires_api_key',
-      memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`,
-      warnings: []
-    }
+      text_generation: process.env.HUGGINGFACE_API_KEY ? 'huggingface-configured' : 'huggingface-missing-key',
+      audio_transcription: process.env.ASSEMBLYAI_API_KEY ? 'assemblyai-configured' : 'assemblyai-missing-key',
+      memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`
+    },
+    warnings: []
   };
 
-  try {
-    if (process.env.HUGGINGFACE_API_KEY) {
-      const test = await axios.get('https://api-inference.huggingface.co/status', {
+  // Test Hugging Face connection
+  if (process.env.HUGGINGFACE_API_KEY) {
+    try {
+      await axios.get('https://api-inference.huggingface.co/status', {
         headers: { 'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}` },
         timeout: 5000
       });
-      health.services.huggingface_status = test.data;
-      
-      if (test.data?.loaded && test.data.loaded < 1) {
-        health.warnings.push('Hugging Face models may need warm-up');
-      }
+    } catch (error) {
+      health.services.text_generation = 'huggingface-connection-failed';
+      health.warnings.push('Hugging Face connection failed');
     }
-  } catch (error) {
-    health.services.huggingface_status = 'connection_failed';
-    health.warnings.push(`HF API: ${error.message}`);
+  }
+
+  // Test AssemblyAI connection
+  if (process.env.ASSEMBLYAI_API_KEY) {
+    try {
+      await axios.get('https://api.assemblyai.com/v2', {
+        headers: { 'Authorization': process.env.ASSEMBLYAI_API_KEY },
+        timeout: 5000
+      });
+    } catch (error) {
+      health.services.audio_transcription = 'assemblyai-connection-failed';
+      health.warnings.push('AssemblyAI connection failed');
+    }
   }
 
   res.json(health);
 });
 
-// Error Handling Middleware
+// Error Handling Middleware (unchanged)
 app.use((err, req, res, next) => {
   console.error('Server Error:', err.stack);
   res.status(500).json({
@@ -286,5 +327,6 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Hugging Face API: ${process.env.HUGGINGFACE_API_KEY ? 'Configured' : 'Not configured'}`);
+  console.log(`AssemblyAI API: ${process.env.ASSEMBLYAI_API_KEY ? 'Configured' : 'Not configured'}`);
   console.log(`PDF Limit: 25MB | Audio Limit: 5MB`);
 });
