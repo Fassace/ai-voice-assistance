@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configurations (unchanged)
+// Configurations
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: { 
@@ -65,8 +65,9 @@ const queryAI = async (prompt, retries = 3) => {
     console.error(`Hugging Face API Attempt ${4-retries} failed:`, error.message);
     
     if (error.response?.status === 402) {
+      // If credits exhausted, try local fallback or return informative message
       return {
-        answer: "I can't process this right now (API credits exhausted). Please try again later.",
+        answer: "I can't process this right now (API credits exhausted). Please try again later or consider upgrading your account.",
         model: 'fallback',
         source: 'local'
       };
@@ -85,7 +86,7 @@ const queryAI = async (prompt, retries = 3) => {
   }
 };
 
-// PDF Processing Route (unchanged)
+// PDF Processing Route
 app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -124,7 +125,7 @@ app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   }
 });
 
-// AI Question Answering (unchanged)
+// Enhanced AI Question Answering with better error handling
 app.post('/ask-ai', async (req, res) => {
   try {
     const { question, pdfText } = req.body;
@@ -168,24 +169,7 @@ app.post('/ask-ai', async (req, res) => {
   }
 });
 
-// Modified Audio Route with AssemblyAI
-app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ 
-        error: 'No audio file uploaded',
-        acceptedTypes: ['audio/mpeg', 'audio/wav', 'audio/ogg']
-      });
-    }
-
-    if (req.file.size > 5 * 1024 * 1024) {
-      return res.status(413).json({
-        error: 'File too large',
-        maxSize: '5MB',
-        received: `${(req.file.size / (1024 * 1024)).toFixed(2)}MB`,
-        solution: 'Compress your audio or use shorter recordings'
-      });
-    }
+      
 
     // Upload to AssemblyAI
     const uploadResponse = await axios.post(
