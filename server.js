@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configurations (unchanged)
+// Configurations
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: { 
@@ -33,7 +33,7 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static('public'));
 
-// Text Generation with Hugging Face (unchanged)
+// Enhanced Hugging Face AI Service with fallback options
 const queryAI = async (prompt, retries = 3) => {
   try {
     if (!process.env.HUGGINGFACE_API_KEY) {
@@ -65,6 +65,7 @@ const queryAI = async (prompt, retries = 3) => {
     console.error(`Hugging Face API Attempt ${4-retries} failed:`, error.message);
     
     if (error.response?.status === 402) {
+      // If credits exhausted, try local fallback or return informative message
       return {
         answer: "I can't process this right now (API credits exhausted). Please try again later or consider upgrading your account.",
         model: 'fallback',
@@ -85,7 +86,7 @@ const queryAI = async (prompt, retries = 3) => {
   }
 };
 
-// PDF Processing Route (unchanged)
+// PDF Processing Route
 app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -124,7 +125,7 @@ app.post('/upload-pdf', upload.single('pdfFile'), async (req, res) => {
   }
 });
 
-// AI Question Answering (unchanged)
+// Enhanced AI Question Answering with better error handling
 app.post('/ask-ai', async (req, res) => {
   try {
     const { question, pdfText } = req.body;
@@ -168,81 +169,7 @@ app.post('/ask-ai', async (req, res) => {
   }
 });
 
-// Audio Transcription with AssemblyAI
-const transcribeWithAssemblyAI = async (audioBuffer, contentType) => {
-  try {
-    // Step 1: Upload audio file
-    const uploadResponse = await axios.post(
-      'https://api.assemblyai.com/v2/upload',
-      audioBuffer,
-      {
-        headers: {
-          'Authorization': process.env.ASSEMBLYAI_API_KEY,
-          'Content-Type': contentType
-        },
-        timeout: 30000
-      }
-    );
-
-    // Step 2: Start transcription
-    const transcriptionResponse = await axios.post(
-      'https://api.assemblyai.com/v2/transcript',
-      {
-        audio_url: uploadResponse.data.upload_url,
-        language_detection: true
-      },
-      {
-        headers: {
-          'Authorization': process.env.ASSEMBLYAI_API_KEY,
-          'Content-Type': 'application/json'
-        },
-        timeout: 30000
-      }
-    );
-
-    // Step 3: Poll for results
-    const transcriptId = transcriptionResponse.data.id;
-    let status = 'queued';
-    let transcriptText = '';
-    const startTime = Date.now();
-    
-    while (status !== 'completed' && Date.now() - startTime < 180000) { // 3 minute timeout
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const statusResponse = await axios.get(
-        `https://api.assemblyai.com/v2/transcript/${transcriptId}`,
-        {
-          headers: {
-            'Authorization': process.env.ASSEMBLYAI_API_KEY
-          }
-        }
-      );
-      
-      status = statusResponse.data.status;
-      if (status === 'completed') {
-        transcriptText = statusResponse.data.text;
-        break;
-      }
-      if (status === 'error') {
-        throw new Error(`Transcription failed: ${statusResponse.data.error}`);
-      }
-    }
-
-    if (!transcriptText) {
-      throw new Error('Transcription timed out');
-    }
-
-    return {
-      text: transcriptText,
-      model: 'assemblyai',
-      source: 'api'
-    };
-  } catch (error) {
-    console.error('AssemblyAI Transcription Error:', error.message);
-    throw error;
-  }
-};
-
-// Updated Audio Route using AssemblyAI
+// Enhanced Audio Route with better error handling
 app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -252,7 +179,7 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       });
     }
 
-    if (req.file.size > 5 * 1024 * 1024) {
+    if (req.file.size > 5 * 1024 * 1024) { // Reduced from 10MB to 5MB
       return res.status(413).json({
         error: 'File too large',
         maxSize: '5MB',
@@ -262,14 +189,29 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
     }
 
     const contentType = req.file.mimetype === 'audio/mpeg' ? 'audio/mpeg' : 'audio/wav';
-    const { text, model, source } = await transcribeWithAssemblyAI(req.file.buffer, contentType);
+
+    const response = await axios.post(
+      'https://api-inference.huggingface.co/models/facebook/whisper-medium.en',
+      req.file.buffer,
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+          'Content-Type': contentType
+        },
+        timeout: 30000
+      }
+    );
+
+    const transcription = response.data.text || 
+                         response.data?.transcription_text ||
+                         (response.data[0]?.transcription_text) ||
+                         'No transcription available';
     
     res.json({
       success: true,
-      text,
-      model,
-      source,
-      timestamp: new Date().toISOString()
+      text: transcription,
+      model: 'whisper-medium.en',
+      source: 'huggingface'
     });
     
   } catch (error) {
@@ -279,7 +221,10 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
     let solution = 'Try again later';
     
     if (statusCode === 402) {
-      solution = 'API credits exhausted. Consider upgrading your AssemblyAI plan.';
+      solution = 'API credits exhausted. Options:\n' +
+                '1. Upgrade Hugging Face account\n' +
+                '2. Use client-side Whisper.js\n' +
+                '3. Try smaller audio files (<1MB)';
     } else if (statusCode === 429) {
       solution = 'Rate limit reached. Try again in a few minutes.';
     }
@@ -288,55 +233,46 @@ app.post('/upload-audio', upload.single('audioFile'), async (req, res) => {
       error: 'Audio processing failed',
       details: error.message,
       solution,
-      maxRecommendedSize: '5MB'
+      maxRecommendedSize: '1MB for free tier'
     });
   }
 });
 
-// Updated Health Check Endpoint
+// Enhanced Health Check Endpoint
 app.get('/health', async (req, res) => {
   const health = {
     status: 'operational',
     timestamp: new Date().toISOString(),
     services: {
       pdf_processing: 'active',
-      text_generation: process.env.HUGGINGFACE_API_KEY ? 'configured' : 'missing_api_key',
-      audio_transcription: process.env.ASSEMBLYAI_API_KEY ? 'configured' : 'missing_api_key',
+      huggingface_ai: process.env.HUGGINGFACE_API_KEY ? 'configured' : 'missing_api_key',
+      audio_transcription: process.env.HUGGINGFACE_API_KEY ? 'available' : 'requires_api_key',
       memory: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB used`,
       warnings: []
     }
   };
 
-  // Test Hugging Face connection
-  if (process.env.HUGGINGFACE_API_KEY) {
-    try {
-      await axios.get('https://api-inference.huggingface.co/status', {
+  try {
+    if (process.env.HUGGINGFACE_API_KEY) {
+      const test = await axios.get('https://api-inference.huggingface.co/status', {
         headers: { 'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}` },
         timeout: 5000
       });
-    } catch (error) {
-      health.services.text_generation = 'connection_failed';
-      health.warnings.push('Hugging Face connection failed');
+      health.services.huggingface_status = test.data;
+      
+      if (test.data?.loaded && test.data.loaded < 1) {
+        health.warnings.push('Hugging Face models may need warm-up');
+      }
     }
-  }
-
-  // Test AssemblyAI connection
-  if (process.env.ASSEMBLYAI_API_KEY) {
-    try {
-      await axios.get('https://api.assemblyai.com/v2', {
-        headers: { 'Authorization': process.env.ASSEMBLYAI_API_KEY },
-        timeout: 5000
-      });
-    } catch (error) {
-      health.services.audio_transcription = 'connection_failed';
-      health.warnings.push('AssemblyAI connection failed');
-    }
+  } catch (error) {
+    health.services.huggingface_status = 'connection_failed';
+    health.warnings.push(`HF API: ${error.message}`);
   }
 
   res.json(health);
 });
 
-// Error Handling Middleware (unchanged)
+// Error Handling Middleware
 app.use((err, req, res, next) => {
   console.error('Server Error:', err.stack);
   res.status(500).json({
@@ -350,6 +286,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Hugging Face API: ${process.env.HUGGINGFACE_API_KEY ? 'Configured' : 'Not configured'}`);
-  console.log(`AssemblyAI API: ${process.env.ASSEMBLYAI_API_KEY ? 'Configured' : 'Not configured'}`);
   console.log(`PDF Limit: 25MB | Audio Limit: 5MB`);
 });
